@@ -1,56 +1,35 @@
 import React, { useState, useRef } from 'react';
-import { 
-  Upload, 
-  FileText, 
-  Trash2, 
-  RotateCw, 
-  Download, 
-  ChevronUp, 
-  ChevronDown, 
-  Eye, 
-  X,
-  FilePlus,
-  RefreshCw,
-  Info,
-  CheckCircle,
-  HelpCircle
-} from 'lucide-react';
+import { FileText, FilePlus } from 'lucide-react';
 import * as pdfjsLib from 'pdfjs-dist';
 import { PDFDocument, degrees } from 'pdf-lib';
 
 // Set up PDF.js Worker
-// For local development and build compatibility, we can assign the worker class directly.
-// This is the cleanest React/Vite-compatible setup for pdfjs-dist.
 import pdfjsWorker from 'pdfjs-dist/build/pdf.worker.mjs?url';
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
 
-interface PDFPageItem {
-  id: string; // unique ID for key and drag-drop
-  fileId: string; // which file this page belongs to
-  fileName: string; // name of the source file
-  originalPageNumber: number; // 0-indexed page number in the original file
-  rotation: number; // degrees: 0, 90, 180, 270
-  thumbnailUrl: string; // Data URL of the page preview
-  width: number;
-  height: number;
-}
-
-interface LoadedFile {
-  id: string;
-  name: string;
-  size: number;
-  pageCount: number;
-  arrayBuffer: ArrayBuffer;
-}
+import type { PDFPageItem, LoadedFile, Section } from './types';
+import { StatusToast } from './components/StatusToast';
+import { LoadingOverlay } from './components/LoadingOverlay';
+import { EmptyState } from './components/EmptyState';
+import { PreviewModal } from './components/PreviewModal';
+import { EditorPage } from './pages/EditorPage';
+import { SplitPage } from './pages/SplitPage';
 
 export default function App() {
+  const [activeTab, setActiveTab] = useState<'editor' | 'split'>('editor');
   const [files, setFiles] = useState<LoadedFile[]>([]);
   const [pages, setPages] = useState<PDFPageItem[]>([]);
+  const [sections, setSections] = useState<Section[]>([
+    { id: 'default', name: 'Bagian 1', startIndex: 0 }
+  ]);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [statusMessage, setStatusMessage] = useState<{ text: string; type: 'info' | 'success' | 'error' } | null>(null);
   const [previewPage, setPreviewPage] = useState<PDFPageItem | null>(null);
   const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
   const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
+
+  const [splitRangeStart, setSplitRangeStart] = useState<string>('');
+  const [splitRangeEnd, setSplitRangeEnd] = useState<string>('');
   
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -62,7 +41,6 @@ export default function App() {
     }
   };
 
-  // Helper to generate a random ID
   const generateId = () => Math.random().toString(36).substring(2, 9);
 
   // Load and render PDF pages
@@ -87,9 +65,6 @@ export default function App() {
         const arrayBuffer = await file.arrayBuffer();
         const fileId = generateId();
 
-        // Load document with pdf.js to render pages
-        // Convert arrayBuffer to a Uint8Array which is safer and fully supported by PDF.js
-        // We slice / copy it so that we don't detach or lose ownership of the buffer
         const typedArray = new Uint8Array(arrayBuffer.slice(0));
         const loadingTask = pdfjsLib.getDocument({ data: typedArray });
         const pdfDoc = await loadingTask.promise;
@@ -100,13 +75,13 @@ export default function App() {
           name: file.name,
           size: file.size,
           pageCount,
-          arrayBuffer: arrayBuffer.slice(0) // Save a copy to prevent detached buffer issues
+          arrayBuffer: arrayBuffer.slice(0)
         });
 
         // Extract pages & render thumbnails
         for (let pageNum = 1; pageNum <= pageCount; pageNum++) {
           const page = await pdfDoc.getPage(pageNum);
-          const viewport = page.getViewport({ scale: 0.3 }); // Small scale for thumbnail
+          const viewport = page.getViewport({ scale: 0.3 });
           
           const canvas = document.createElement('canvas');
           const context = canvas.getContext('2d');
@@ -127,7 +102,7 @@ export default function App() {
             id: generateId(),
             fileId,
             fileName: file.name,
-            originalPageNumber: pageNum - 1, // 0-indexed
+            originalPageNumber: pageNum - 1,
             rotation: 0,
             thumbnailUrl,
             width: viewport.width,
@@ -176,7 +151,6 @@ export default function App() {
     setDragOverIndex(null);
   };
 
-  // Reorder buttons (alternate to drag and drop)
   const movePage = (index: number, direction: 'up' | 'down') => {
     const targetIndex = direction === 'up' ? index - 1 : index + 1;
     if (targetIndex < 0 || targetIndex >= pages.length) return;
@@ -187,7 +161,6 @@ export default function App() {
     setPages(updatedPages);
   };
 
-  // Rotate page
   const rotatePage = (index: number) => {
     const updatedPages = [...pages];
     updatedPages[index] = {
@@ -197,87 +170,263 @@ export default function App() {
     setPages(updatedPages);
   };
 
-  // Delete page
   const deletePage = (index: number) => {
     const updatedPages = [...pages];
     updatedPages.splice(index, 1);
+    
+    let updatedSections = sections.map(s => {
+      if (s.startIndex > index) {
+        return { ...s, startIndex: Math.max(0, s.startIndex - 1) };
+      }
+      return s;
+    });
+
+    updatedSections = updatedSections.filter((s, idx) => {
+      if (s.id === 'default') return true;
+      return updatedSections.findIndex(sec => sec.startIndex === s.startIndex) === idx;
+    });
+
     setPages(updatedPages);
+    setSections(updatedSections);
   };
 
-  // Clear all pages and files
+  const toggleSplitPoint = (index: number) => {
+    if (index === 0) return;
+
+    const existingSectionIndex = sections.findIndex(s => s.startIndex === index);
+    if (existingSectionIndex !== -1) {
+      const updatedSections = sections.filter(s => s.startIndex !== index);
+      const reindexed = updatedSections.map((s, idx) => ({
+        ...s,
+        name: s.id === 'default' ? 'Bagian 1' : `Bagian ${idx + 1}`
+      }));
+      setSections(reindexed);
+      showStatus('Batas bagian dihapus.', 'info');
+    } else {
+      const newSection: Section = {
+        id: generateId(),
+        name: `Bagian ${sections.length + 1}`,
+        startIndex: index
+      };
+      const updatedSections = [...sections, newSection].sort((a, b) => a.startIndex - b.startIndex);
+      const reindexed = updatedSections.map((s, idx) => ({
+        ...s,
+        name: idx === 0 ? 'Bagian 1' : `Bagian ${idx + 1}`
+      }));
+      setSections(reindexed);
+      showStatus(`Bagian baru dibuat dimulai dari halaman ${index + 1}!`, 'success');
+    }
+  };
+
+  const applyCustomSplitRange = () => {
+    const start = parseInt(splitRangeStart, 10);
+    const end = parseInt(splitRangeEnd, 10);
+
+    if (isNaN(start) || isNaN(end)) {
+      showStatus('Masukkan nomor halaman mulai dan selesai yang valid.', 'error');
+      return;
+    }
+
+    if (start < 1 || end > pages.length || start > end) {
+      showStatus(`Rentang tidak valid. Halaman harus antara 1 sampai ${pages.length}.`, 'error');
+      return;
+    }
+
+    const updatedSections = [...sections];
+
+    const addPoint = (pageNumber: number) => {
+      const idx = pageNumber - 1;
+      if (idx > 0 && idx < pages.length && !updatedSections.some(s => s.startIndex === idx)) {
+        updatedSections.push({
+          id: generateId(),
+          name: `Bagian ${updatedSections.length + 1}`,
+          startIndex: idx
+        });
+      }
+    };
+
+    addPoint(start);
+    addPoint(end + 1);
+
+    const sorted = updatedSections.sort((a, b) => a.startIndex - b.startIndex);
+    const reindexed = sorted.map((s, idx) => ({
+      ...s,
+      name: idx === 0 ? 'Bagian 1' : `Bagian ${idx + 1}`
+    }));
+
+    setSections(reindexed);
+    setSplitRangeStart('');
+    setSplitRangeEnd('');
+    showStatus(`Berhasil memotong bagian untuk rentang halaman ${start} - ${end}!`, 'success');
+  };
+
+  const rotateSection = (sectionStartIndex: number, sectionEndIndex: number) => {
+    const updatedPages = [...pages];
+    for (let i = sectionStartIndex; i < sectionEndIndex; i++) {
+      updatedPages[i] = {
+        ...updatedPages[i],
+        rotation: (updatedPages[i].rotation + 90) % 360
+      };
+    }
+    setPages(updatedPages);
+    showStatus('Semua halaman dalam bagian berhasil diputar.', 'success');
+  };
+
+  const deleteSection = (sectionId: string, sectionStartIndex: number, sectionEndIndex: number) => {
+    const updatedPages = [...pages];
+    const count = sectionEndIndex - sectionStartIndex;
+    updatedPages.splice(sectionStartIndex, count);
+    
+    let updatedSections = sections.filter(s => s.id !== sectionId);
+    updatedSections = updatedSections.map(s => {
+      if (s.startIndex > sectionStartIndex) {
+        return { ...s, startIndex: Math.max(0, s.startIndex - count) };
+      }
+      return s;
+    });
+
+    if (updatedSections.length === 0 || !updatedSections.some(s => s.startIndex === 0)) {
+      const lowest = updatedSections.sort((a, b) => a.startIndex - b.startIndex)[0];
+      if (lowest) {
+        lowest.id = 'default';
+        lowest.startIndex = 0;
+      } else {
+        updatedSections = [{ id: 'default', name: 'Bagian 1', startIndex: 0 }];
+      }
+    }
+
+    const reindexed = updatedSections.sort((a, b) => a.startIndex - b.startIndex).map((s, idx) => ({
+      ...s,
+      name: idx === 0 ? 'Bagian 1' : `Bagian ${idx + 1}`
+    }));
+
+    setPages(updatedPages);
+    setSections(reindexed);
+    showStatus('Seluruh bagian berhasil dihapus.', 'info');
+  };
+
+  const renameSection = (id: string, newName: string) => {
+    setSections(prev => prev.map(s => s.id === id ? { ...s, name: newName } : s));
+  };
+
   const clearAll = () => {
     setFiles([]);
     setPages([]);
+    setSections([{ id: 'default', name: 'Bagian 1', startIndex: 0 }]);
     setPreviewPage(null);
     showStatus('Semua halaman dan berkas telah dibersihkan.', 'info');
   };
 
-  // Merge and Export the PDF
-  const exportPDF = async () => {
+  const generateSectionPDF = async (pageList: PDFPageItem[]) => {
+    const doc = await PDFDocument.create();
+    const pdfLibDocsCache: Record<string, PDFDocument> = {};
+
+    for (const pageItem of pageList) {
+      const sourceFile = files.find(f => f.id === pageItem.fileId);
+      if (!sourceFile) throw new Error(`File source missing.`);
+
+      if (!pdfLibDocsCache[pageItem.fileId]) {
+        pdfLibDocsCache[pageItem.fileId] = await PDFDocument.load(sourceFile.arrayBuffer.slice(0));
+      }
+      const srcDoc = pdfLibDocsCache[pageItem.fileId];
+      const [copiedPage] = await doc.copyPages(srcDoc, [pageItem.originalPageNumber]);
+
+      if (pageItem.rotation !== 0) {
+        const currentRotation = copiedPage.getRotation().angle;
+        copiedPage.setRotation(degrees((currentRotation + pageItem.rotation) % 360));
+      }
+      doc.addPage(copiedPage);
+    }
+    return await doc.save();
+  };
+
+  const exportPDFs = async (mode: 'merge-all' | 'zip-sections' | string) => {
     if (pages.length === 0) {
       showStatus('Tidak ada halaman untuk diekspor!', 'error');
       return;
     }
 
     setIsLoading(true);
-    showStatus('Menyusun PDF baru...', 'info');
+    showStatus('Sedang memproses ekspor berkas PDF...', 'info');
+
+    const sortedSections = [...sections].sort((a, b) => a.startIndex - b.startIndex);
+
+    const sectionBundles: { section: Section; pages: PDFPageItem[] }[] = [];
+    for (let i = 0; i < sortedSections.length; i++) {
+      const current = sortedSections[i];
+      const next = sortedSections[i + 1];
+      const sectionPages = pages.slice(current.startIndex, next ? next.startIndex : pages.length);
+      
+      if (sectionPages.length > 0) {
+        sectionBundles.push({ section: current, pages: sectionPages });
+      }
+    }
 
     try {
-      const mergedPdf = await PDFDocument.create();
-
-      // Cache loaded pdf-lib documents to avoid loading them repeatedly
-      const pdfLibDocsCache: Record<string, PDFDocument> = {};
-
-      for (const pageItem of pages) {
-        const sourceFile = files.find(f => f.id === pageItem.fileId);
-        if (!sourceFile) {
-          throw new Error(`File dengan ID ${pageItem.fileId} tidak ditemukan.`);
-        }
-
-        // Load document if not in cache
-        if (!pdfLibDocsCache[pageItem.fileId]) {
-          // Send a sliced copy to prevent detaching/modifying the original buffer
-          pdfLibDocsCache[pageItem.fileId] = await PDFDocument.load(sourceFile.arrayBuffer.slice(0));
-        }
-
-        const srcDoc = pdfLibDocsCache[pageItem.fileId];
+      if (mode === 'merge-all' || sectionBundles.length === 1) {
+        const pdfBytes = await generateSectionPDF(pages);
+        const blob = new Blob([pdfBytes as any], { type: 'application/pdf' });
+        const url = URL.createObjectURL(blob);
         
-        // Copy the specific page
-        const [copiedPage] = await mergedPdf.copyPages(srcDoc, [pageItem.originalPageNumber]);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = 'merged_document.pdf';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
         
-        // Apply rotation adjustment if any
-        if (pageItem.rotation !== 0) {
-          const currentRotation = copiedPage.getRotation().angle;
-          copiedPage.setRotation(degrees((currentRotation + pageItem.rotation) % 360));
+        showStatus('PDF berhasil digabungkan dan diunduh!', 'success');
+      } 
+      else if (mode === 'zip-sections') {
+        const { default: JSZip } = await import('jszip');
+        const zip = new JSZip();
+
+        for (const bundle of sectionBundles) {
+          const pdfBytes = await generateSectionPDF(bundle.pages);
+          const sanitizedFilename = bundle.section.name.replace(/[^a-z0-9_-]/gi, '_') + '.pdf';
+          zip.file(sanitizedFilename, pdfBytes);
         }
 
-        mergedPdf.addPage(copiedPage);
+        const zipBlob = await zip.generateAsync({ type: 'blob' });
+        const url = URL.createObjectURL(zipBlob);
+
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = 'pdf_sections_split.zip';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+
+        showStatus('ZIP berisi semua bagian berhasil diunduh!', 'success');
+      } 
+      else {
+        const targetBundle = sectionBundles.find(b => b.section.id === mode);
+        if (!targetBundle) throw new Error('Bagian tidak ditemukan');
+
+        const pdfBytes = await generateSectionPDF(targetBundle.pages);
+        const blob = new Blob([pdfBytes as any], { type: 'application/pdf' });
+        const url = URL.createObjectURL(blob);
+        
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `${targetBundle.section.name.replace(/[^a-z0-9_-]/gi, '_')}.pdf`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+
+        showStatus(`Bagian "${targetBundle.section.name}" berhasil diunduh!`, 'success');
       }
-
-      // Save PDF and trigger download
-      const mergedPdfBytes = await mergedPdf.save();
-      // Ensure mergedPdfBytes is casted or structured appropriately for Blob constructor in TS
-      const blob = new Blob([mergedPdfBytes as any], { type: 'application/pdf' });
-      const url = URL.createObjectURL(blob);
-      
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = 'edited_document.pdf';
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      URL.revokeObjectURL(url);
-
-      showStatus('PDF berhasil diekspor dan diunduh!', 'success');
     } catch (error) {
       console.error('Error exporting PDF:', error);
-      showStatus('Gagal mengekspor PDF baru.', 'error');
+      showStatus('Gagal mengekspor berkas PDF.', 'error');
     } finally {
       setIsLoading(false);
     }
   };
 
-  // Format file size
   const formatBytes = (bytes: number, decimals = 2) => {
     if (bytes === 0) return '0 Bytes';
     const k = 1024;
@@ -287,21 +436,71 @@ export default function App() {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
   };
 
+  const getSectionGroups = () => {
+    const validSections = sections.filter(s => s.startIndex < pages.length || s.id === 'default');
+    const sorted = [...validSections].sort((a, b) => a.startIndex - b.startIndex);
+    
+    return sorted.map((sec, idx) => {
+      const nextSec = sorted[idx + 1];
+      const startIndex = sec.startIndex;
+      const endIndex = nextSec ? nextSec.startIndex : pages.length;
+      const sectionPages = pages.slice(startIndex, endIndex).map((page, localIdx) => ({
+        page,
+        globalIndex: startIndex + localIdx
+      }));
+
+      return {
+        section: sec,
+        pages: sectionPages,
+        startIndex,
+        endIndex,
+        nextSectionStartIndex: nextSec ? nextSec.startIndex : null
+      };
+    });
+  };
+
+  const sectionGroups = getSectionGroups();
+
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800 flex flex-col font-sans">
       {/* Header */}
       <header className="bg-white border-b border-slate-200 sticky top-0 z-10 shadow-xs">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex items-center justify-between">
-          <div className="flex items-center space-x-3">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex flex-col sm:flex-row items-center justify-between gap-4">
+          <div className="flex items-center space-x-3 self-start sm:self-auto">
             <div className="bg-red-500 text-white p-2.5 rounded-lg shadow-sm">
               <FileText className="h-6 w-6" />
             </div>
             <div>
-              <h1 className="text-xl font-bold tracking-tight text-slate-900 m-0">Urbays PDF Editor</h1>
-              <p className="text-xs text-slate-500 m-0">Atur ulang, rotasi, hapus, dan gabung halaman PDF secara visual</p>
+              <h1 className="text-xl font-bold tracking-tight text-slate-900 m-0">Urbays PDF Editor & Splitter</h1>
+              <p className="text-xs text-slate-500 m-0">Atur ulang, rotasi, hapus, pisahkan section & gabung PDF secara visual</p>
             </div>
           </div>
-          <div className="flex items-center space-x-2">
+          
+          {/* Navigation Menu Tabs */}
+          <div className="flex bg-slate-100 p-1 rounded-xl">
+            <button
+              onClick={() => setActiveTab('editor')}
+              className={`px-4 py-2 text-xs font-bold rounded-lg transition-colors cursor-pointer ${
+                activeTab === 'editor'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-500 hover:text-slate-900'
+              }`}
+            >
+              Editor & Merger
+            </button>
+            <button
+              onClick={() => setActiveTab('split')}
+              className={`px-4 py-2 text-xs font-bold rounded-lg transition-colors cursor-pointer ${
+                activeTab === 'split'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-500 hover:text-slate-900'
+              }`}
+            >
+              Split Section
+            </button>
+          </div>
+
+          <div className="flex items-center space-x-2 self-end sm:self-auto">
             <button
               onClick={() => fileInputRef.current?.click()}
               className="inline-flex items-center space-x-2 px-4 py-2 bg-slate-950 text-white hover:bg-slate-800 rounded-lg text-sm font-semibold transition cursor-pointer shadow-xs"
@@ -324,300 +523,91 @@ export default function App() {
 
       {/* Main Workspace */}
       <main className="flex-1 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 w-full flex flex-col gap-6">
-        
-        {/* Status Messages */}
-        {statusMessage && (
-          <div className={`p-4 rounded-xl border flex items-start space-x-3 transition-all ${
-            statusMessage.type === 'success' 
-              ? 'bg-emerald-50 border-emerald-200 text-emerald-800' 
-              : statusMessage.type === 'error' 
-              ? 'bg-rose-50 border-rose-200 text-rose-800' 
-              : 'bg-blue-50 border-blue-200 text-blue-800'
-          }`}>
-            {statusMessage.type === 'success' ? (
-              <CheckCircle className="h-5 w-5 shrink-0 text-emerald-600" />
-            ) : statusMessage.type === 'error' ? (
-              <X className="h-5 w-5 shrink-0 text-rose-600" />
-            ) : (
-              <Info className="h-5 w-5 shrink-0 text-blue-600" />
-            )}
-            <span className="text-sm font-medium">{statusMessage.text}</span>
-          </div>
-        )}
-
-        {/* Loading Overlay */}
-        {isLoading && (
-          <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center z-50">
-            <div className="bg-white p-6 rounded-2xl shadow-xl flex flex-col items-center space-y-4 max-w-xs w-full text-center">
-              <RefreshCw className="h-10 w-10 text-red-500 animate-spin" />
-              <p className="text-slate-800 font-semibold">Sedang diproses...</p>
-              <p className="text-xs text-slate-500">Mohon tunggu beberapa saat untuk pemrosesan file PDF.</p>
-            </div>
-          </div>
-        )}
+        <StatusToast statusMessage={statusMessage} />
+        <LoadingOverlay isLoading={isLoading} />
 
         {/* Empty State */}
-        {pages.length === 0 && (
-          <div className="flex-1 border-2 border-dashed border-slate-300 rounded-3xl bg-white p-12 flex flex-col items-center justify-center text-center shadow-xs">
-            <div className="bg-red-50 p-6 rounded-full mb-4">
-              <Upload className="h-12 w-12 text-red-500" />
-            </div>
-            <h3 className="text-lg font-bold text-slate-900 mb-1">Unggah Dokumen PDF Anda</h3>
-            <p className="text-sm text-slate-500 max-w-md mb-6">
-              Pilih satu atau beberapa file PDF dari komputer Anda. Anda dapat mengatur ulang urutan halaman dengan menyeretnya (drag & drop), atau memutarnya dan menghapus halaman yang tidak diinginkan.
-            </p>
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              className="inline-flex items-center space-x-2 px-6 py-3 bg-red-500 text-white hover:bg-red-600 font-semibold rounded-xl text-base shadow-lg shadow-red-500/20 transition cursor-pointer"
-            >
-              <Upload className="h-5 w-5" />
-              <span>Pilih File PDF</span>
-            </button>
-          </div>
-        )}
-
-        {/* Workspace Columns */}
-        {pages.length > 0 && (
-          <div className="flex flex-col lg:flex-row gap-6 items-start">
-            
-            {/* Left sidebar: File list & Actions */}
-            <div className="w-full lg:w-80 bg-white border border-slate-200 rounded-2xl p-6 shrink-0 shadow-sm flex flex-col gap-6">
-              <div>
-                <h3 className="text-sm font-bold text-slate-900 uppercase tracking-wider mb-3">Dokumen Sumber</h3>
-                <div className="space-y-3 max-h-48 overflow-y-auto pr-1">
-                  {files.map(file => (
-                    <div key={file.id} className="p-3 bg-slate-50 border border-slate-200 rounded-xl flex items-start space-x-3">
-                      <FileText className="h-5 w-5 text-red-500 shrink-0 mt-0.5" />
-                      <div className="min-w-0 flex-1">
-                        <p className="text-xs font-semibold text-slate-800 truncate" title={file.name}>
-                          {file.name}
-                        </p>
-                        <p className="text-[10px] text-slate-500 font-medium">
-                          {file.pageCount} Halaman • {formatBytes(file.size)}
-                        </p>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              <div className="border-t border-slate-100 pt-5">
-                <h3 className="text-sm font-bold text-slate-900 uppercase tracking-wider mb-3">Ringkasan Output</h3>
-                <div className="bg-slate-50 p-4 rounded-xl space-y-2 mb-4">
-                  <div className="flex justify-between text-xs">
-                    <span className="text-slate-500 font-medium">Total Halaman:</span>
-                    <span className="font-bold text-slate-800">{pages.length} Halaman</span>
-                  </div>
-                  <div className="flex justify-between text-xs">
-                    <span className="text-slate-500 font-medium">Jumlah Dokumen:</span>
-                    <span className="font-bold text-slate-800">{files.length} File</span>
-                  </div>
-                </div>
-                
-                <div className="space-y-2">
-                  <button
-                    onClick={exportPDF}
-                    className="w-full inline-flex items-center justify-center space-x-2 px-4 py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-xl text-sm shadow-md transition cursor-pointer"
-                  >
-                    <Download className="h-4 w-4" />
-                    <span>Unduh PDF Baru</span>
-                  </button>
-                  <button
-                    onClick={clearAll}
-                    className="w-full inline-flex items-center justify-center space-x-2 px-4 py-3 bg-white border border-slate-200 text-slate-700 hover:bg-slate-50 font-semibold rounded-xl text-sm transition cursor-pointer"
-                  >
-                    <Trash2 className="h-4 w-4 text-slate-400" />
-                    <span>Reset Semua</span>
-                  </button>
-                </div>
-              </div>
-
-              <div className="border-t border-slate-100 pt-5">
-                <div className="flex items-start space-x-2 text-xs text-slate-500 bg-slate-50/50 p-3 rounded-xl">
-                  <HelpCircle className="h-4 w-4 text-slate-400 shrink-0 mt-0.5" />
-                  <p className="leading-relaxed">
-                    <strong>Petunjuk:</strong> Geser kartu halaman untuk mengubah urutan, atau gunakan tombol panah <ChevronUp className="h-3 w-3 inline" /> <ChevronDown className="h-3 w-3 inline" /> untuk memindahkannya ke atas/bawah. Gunakan tombol <RotateCw className="h-3 w-3 inline" /> untuk merotasi halaman 90 derajat.
-                  </p>
-                </div>
-              </div>
-            </div>
-
-            {/* Right: Pages Grid */}
-            <div className="flex-1 w-full bg-white border border-slate-200 rounded-2xl p-6 shadow-sm">
-              <div className="flex items-center justify-between mb-6">
-                <div>
-                  <h2 className="text-lg font-bold text-slate-900 m-0">Tata Letak Halaman</h2>
-                  <p className="text-xs text-slate-500 m-0">Atur halaman di bawah ini sesuka Anda</p>
-                </div>
-                <div className="text-xs text-slate-400 font-medium">
-                  {pages.length} Halaman Siap
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-5 gap-6">
-                {pages.map((page, index) => {
-                  const isDragged = draggedIndex === index;
-                  const isDragOver = dragOverIndex === index;
-
-                  return (
-                    <div
-                      key={page.id}
-                      draggable
-                      onDragStart={() => handleDragStart(index)}
-                      onDragOver={(e) => handleDragOver(e, index)}
-                      onDrop={(e) => handleDrop(e, index)}
-                      onDragEnd={() => {
-                        setDraggedIndex(null);
-                        setDragOverIndex(null);
-                      }}
-                      className={`group relative border rounded-xl bg-slate-50 flex flex-col p-2.5 transition-all select-none ${
-                        isDragged ? 'opacity-30 border-blue-500 bg-blue-50/20' : ''
-                      } ${
-                        isDragOver ? 'border-dashed border-red-500 scale-105 bg-red-50/10' : 'border-slate-200 hover:border-slate-300 hover:shadow-md'
-                      }`}
-                    >
-                      {/* Drag handle / Hover Overlay */}
-                      <div className="absolute top-2 right-2 flex space-x-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity z-10">
-                        <button
-                          onClick={() => setPreviewPage(page)}
-                          className="bg-white border border-slate-200 p-1.5 rounded-lg text-slate-600 hover:text-slate-900 shadow-xs cursor-pointer"
-                          title="Lihat Detail Halaman"
-                        >
-                          <Eye className="h-3.5 w-3.5" />
-                        </button>
-                        <button
-                          onClick={() => rotatePage(index)}
-                          className="bg-white border border-slate-200 p-1.5 rounded-lg text-slate-600 hover:text-slate-900 shadow-xs cursor-pointer"
-                          title="Putar 90°"
-                        >
-                          <RotateCw className="h-3.5 w-3.5" />
-                        </button>
-                        <button
-                          onClick={() => deletePage(index)}
-                          className="bg-white border border-slate-200 p-1.5 rounded-lg text-red-500 hover:text-red-700 shadow-xs cursor-pointer"
-                          title="Hapus Halaman"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
-                      </div>
-
-                      {/* Thumbnail Container */}
-                      <div className="aspect-3/4 bg-white border border-slate-200 rounded-lg flex items-center justify-center overflow-hidden relative cursor-grab active:cursor-grabbing mb-3">
-                        <img
-                          src={page.thumbnailUrl}
-                          alt={`Halaman ${index + 1}`}
-                          className="max-h-full max-w-full object-contain transition-transform"
-                          style={{
-                            transform: `rotate(${page.rotation}deg)`,
-                          }}
-                        />
-                        {/* Page number badge */}
-                        <div className="absolute bottom-2 left-2 px-2 py-0.5 bg-slate-900/70 backdrop-blur-xs text-white rounded text-[10px] font-bold">
-                          {index + 1}
-                        </div>
-                      </div>
-
-                      {/* Source details */}
-                      <div className="mt-auto">
-                        <p className="text-[10px] font-bold text-slate-800 truncate" title={page.fileName}>
-                          {page.fileName}
-                        </p>
-                        <p className="text-[9px] text-slate-400 font-medium">
-                          Hal Asli: {page.originalPageNumber + 1}
-                        </p>
-                      </div>
-
-                      {/* Move controls for mobile/accessibility */}
-                      <div className="mt-2.5 pt-2 border-t border-slate-200 flex justify-between items-center gap-1.5">
-                        <button
-                          onClick={() => movePage(index, 'up')}
-                          disabled={index === 0}
-                          className="flex-1 py-1 rounded bg-slate-100 text-slate-500 hover:bg-slate-200 disabled:opacity-40 disabled:hover:bg-slate-100 flex items-center justify-center cursor-pointer"
-                          title="Pindah Kiri/Atas"
-                        >
-                          <ChevronUp className="h-3.5 w-3.5 rotate-270" />
-                        </button>
-                        <button
-                          onClick={() => movePage(index, 'down')}
-                          disabled={index === pages.length - 1}
-                          className="flex-1 py-1 rounded bg-slate-100 text-slate-500 hover:bg-slate-200 disabled:opacity-40 disabled:hover:bg-slate-100 flex items-center justify-center cursor-pointer"
-                          title="Pindah Kanan/Bawah"
-                        >
-                          <ChevronDown className="h-3.5 w-3.5 rotate-270" />
-                        </button>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-
-          </div>
+        {pages.length === 0 ? (
+          <EmptyState onUploadClick={() => fileInputRef.current?.click()} />
+        ) : (
+          /* Render Active Page Tab */
+          activeTab === 'editor' ? (
+            <EditorPage
+              files={files}
+              pages={pages}
+              draggedIndex={draggedIndex}
+              dragOverIndex={dragOverIndex}
+              handleDragStart={handleDragStart}
+              handleDragOver={handleDragOver}
+              handleDrop={handleDrop}
+              setDraggedIndex={setDraggedIndex}
+              setDragOverIndex={setDragOverIndex}
+              setPreviewPage={setPreviewPage}
+              rotatePage={rotatePage}
+              deletePage={deletePage}
+              movePage={movePage}
+              exportPDFs={exportPDFs}
+              clearAll={clearAll}
+              formatBytes={(b) => formatBytes(b)}
+            />
+          ) : (
+            <SplitPage
+              files={files}
+              pages={pages}
+              sections={sections}
+              sectionGroups={sectionGroups}
+              draggedIndex={draggedIndex}
+              dragOverIndex={dragOverIndex}
+              splitRangeStart={splitRangeStart}
+              splitRangeEnd={splitRangeEnd}
+              setSplitRangeStart={setSplitRangeStart}
+              setSplitRangeEnd={setSplitRangeEnd}
+              handleDragStart={handleDragStart}
+              handleDragOver={handleDragOver}
+              handleDrop={handleDrop}
+              setDraggedIndex={setDraggedIndex}
+              setDragOverIndex={setDragOverIndex}
+              setPreviewPage={setPreviewPage}
+              rotatePage={rotatePage}
+              deletePage={deletePage}
+              movePage={movePage}
+              toggleSplitPoint={toggleSplitPoint}
+              renameSection={renameSection}
+              rotateSection={rotateSection}
+              deleteSection={deleteSection}
+              applyCustomSplitRange={applyCustomSplitRange}
+              exportPDFs={exportPDFs}
+              clearAll={clearAll}
+              formatBytes={(b) => formatBytes(b)}
+            />
+          )
         )}
       </main>
 
       {/* Preview Modal */}
-      {previewPage && (
-        <div className="fixed inset-0 bg-slate-900/80 backdrop-blur-xs flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-3xl max-w-lg w-full flex flex-col shadow-2xl overflow-hidden max-h-[85vh]">
-            <div className="p-5 border-b border-slate-100 flex justify-between items-center bg-slate-50">
-              <div>
-                <h3 className="text-base font-bold text-slate-900 truncate max-w-xs">{previewPage.fileName}</h3>
-                <p className="text-xs text-slate-500">Halaman Asli: {previewPage.originalPageNumber + 1}</p>
-              </div>
-              <button
-                onClick={() => setPreviewPage(null)}
-                className="p-1.5 hover:bg-slate-200 rounded-lg text-slate-500 transition cursor-pointer"
-              >
-                <X className="h-5 w-5" />
-              </button>
-            </div>
-            <div className="flex-1 overflow-y-auto p-8 flex items-center justify-center bg-slate-100">
-              <div className="shadow-lg rounded-lg border border-slate-200 bg-white p-2">
-                <img
-                  src={previewPage.thumbnailUrl}
-                  alt="Detail Halaman"
-                  className="max-w-full max-h-[50vh] object-contain"
-                  style={{
-                    transform: `rotate(${previewPage.rotation}deg)`,
-                  }}
-                />
-              </div>
-            </div>
-            <div className="p-5 border-t border-slate-100 bg-slate-50 flex justify-between">
-              <button
-                onClick={() => {
-                  const idx = pages.findIndex(p => p.id === previewPage.id);
-                  if (idx !== -1) rotatePage(idx);
-                  setPreviewPage(prev => prev ? { ...prev, rotation: (prev.rotation + 90) % 360 } : null);
-                }}
-                className="inline-flex items-center space-x-2 px-4 py-2 border border-slate-200 hover:bg-slate-200 text-slate-700 rounded-xl text-sm font-semibold transition cursor-pointer"
-              >
-                <RotateCw className="h-4 w-4" />
-                <span>Putar Halaman</span>
-              </button>
-              <button
-                onClick={() => {
-                  const idx = pages.findIndex(p => p.id === previewPage.id);
-                  if (idx !== -1) {
-                    deletePage(idx);
-                    setPreviewPage(null);
-                  }
-                }}
-                className="inline-flex items-center space-x-2 px-4 py-2 bg-rose-50 border border-rose-200 hover:bg-rose-100 text-rose-700 rounded-xl text-sm font-semibold transition cursor-pointer"
-              >
-                <Trash2 className="h-4 w-4" />
-                <span>Hapus Halaman</span>
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <PreviewModal
+        previewPage={previewPage}
+        onClose={() => setPreviewPage(null)}
+        onRotate={() => {
+          const targetIdx = pages.findIndex(p => p.id === previewPage?.id);
+          if (targetIdx !== -1) {
+            rotatePage(targetIdx);
+            setPreviewPage(prev => prev ? { ...prev, rotation: (prev.rotation + 90) % 360 } : null);
+          }
+        }}
+        onDelete={() => {
+          const targetIdx = pages.findIndex(p => p.id === previewPage?.id);
+          if (targetIdx !== -1) {
+            deletePage(targetIdx);
+            setPreviewPage(null);
+          }
+        }}
+      />
 
       {/* Footer */}
       <footer className="bg-white border-t border-slate-200 mt-auto">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 text-center text-xs text-slate-400 font-medium">
-          Dibuat oleh Urbays 2026 
+          Dibuat oleh Urbays 2026 • Semua pemrosesan data dilakukan secara lokal di peramban Anda secara aman.
         </div>
       </footer>
     </div>
